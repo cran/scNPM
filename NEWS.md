@@ -1,3 +1,58 @@
+# scNPM 1.1.0
+
+* Add a four-state matched-network prior, now the default for staged fits.
+  Joint Gaussian kernels distinguish 00, 10, 01 and 11 support states and
+  correlate the two slab coefficients in state 11. No gene modules are added.
+* Add network_prior, paired_discordance, shared_edge_correlation and
+  ppi_reference. Preserve the independent prior as an explicit option and
+  as the automatic choice for coupled inference. Record resolved settings.
+* Update matched graph columns jointly with immediate restoration after
+  integrating each coefficient pair; align matched components together and
+  compute Rao-Blackwell probabilities from the same four-state conditional.
+* Keep NPM, observation-model HMC, stage budgets and BFDR selection rules.
+* Fix the CRAN macOS/Clang test failure: strict non-stabilization is tested
+  with patience greater than the available adaptation budget, rather than
+  assuming one stochastic K=4 trajectory cannot stabilize. Do not skip tests.
+* Keep native test execution at one thread on constrained check machines.
+
+# scNPM 1.0.8
+
+* Add a damped Newton fallback when the pairwise ridge logistic fit fails to
+  converge with full Newton steps. Backtracking uses the same balanced,
+  penalized likelihood and verifies the final gradient.
+* Preserve the existing path for fits that already converge. The fallback
+  does not change the ridge penalty, cross-fitting folds, matching criterion,
+  BFDR rules, sampling schedule, or random-number state.
+* Add regression coverage for fallback convergence and agreement with an
+  independent optimizer.
+
+# scNPM 1.0.7
+
+* Default to pairwise propensity matching using the known treatment/control
+  indicator. Each candidate cluster pair uses balanced ridge logistic
+  regression, training-fold scaling and up to five prediction folds. Retain
+  shared network-reference features and complete one-to-one assignment by
+  minimum maximum SMD, followed by minimum total SMD. Set matching_score =
+  "global" for the previous pooled-score implementation.
+* Add freeze_policy = "consensus" and freeze_window = 100. Stable complete
+  maps freeze after five unchanged iterations, no earlier than adapt_min.
+  At adapt_max, use the most frequent recent valid complete map, with
+  deterministic cost and map tie breaking. Expose freeze_reason,
+  matching_stable, freeze_consensus_fraction and freeze_window_used.
+  Set freeze_policy = "error" for strict stability-only freezing.
+* Use 5000 total iterations and 1000 retained draws by default, with adapt_max
+  = 3000 and at least 1000 post-freeze warmup iterations. Feedback is disabled
+  after freezing; the retained sampling window remains at the end of the run.
+* Add progress_every = 60 and progress_file. Optional progress reports include
+  iteration, stage, elapsed time, approximate ETA, stability count, freezing
+  reason and retained draws. CSV records include timestamps and run IDs.
+  Console output is quiet by default and uses suppressible R messages.
+* Update the retinal workflow and help pages. Extend regression tests for
+  pairwise assignment, consensus freezing, stage transitions and progress
+  output without changes to the sampler random-number state.
+* Group and directional differential networks continue to use the existing
+  BFDR selection rules.
+
 # scNPM 1.0.6
 
 * Address CRAN review: keep the 39-character title, make all help examples

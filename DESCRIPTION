@@ -1,8 +1,8 @@
 Package: scNPM
 Type: Package
 Title: Single-Cell Network Propensity Matching
-Version: 1.0.6
-Date: 2026-10-02
+Version: 1.1.0
+Date: 2026-10-18
 Authors@R: c(
     person(
       given = "Tao",
@@ -16,9 +16,10 @@ Description: Estimates and compares heterogeneous gene conditional-dependence
     probit observation mechanism represent cellular heterogeneity and zero
     observations. Protein interaction information supplies edge-specific prior
     weights, while network propensity matching links cell clusters across
-    conditions and guides adaptation. Staged inference freezes stable matching,
-    disables feedback, and retains baseline-model samples for posterior
-    group and directional differential edge selection. Functions assess balance,
+    conditions and guides adaptation. Staged inference fixes correspondence after adaptation,
+    disables adaptation feedback, and jointly models matched network edges with
+    a four-state spike-and-slab prior for posterior group and directional
+    differential edge selection. Functions assess balance,
     record criterion diagnostics, and visualize within-condition and
     differential networks.
 License: GPL (>= 3)
@@ -37,8 +38,8 @@ Suggests: testthat (>= 3.0.0)
 Config/testthat/edition: 3
 Config/roxygen2/version: 8.1.0
 NeedsCompilation: yes
-Packaged: 2026-10-02 13:46:06 UTC; Lenovo
+Packaged: 2026-10-18 10:06:38 UTC; Lenovo
 Author: Tao Liu [aut, cre]
 Maintainer: Tao Liu <25210690190@m.fudan.edu.cn>
 Repository: CRAN
-Date/Publication: 2026-10-14 11:20:02 UTC
+Date/Publication: 2026-10-19 09:10:02 UTC

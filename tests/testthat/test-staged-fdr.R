@@ -12,7 +12,7 @@ staged_fixture <- function(K=1L) {
   theta <- t(mu[,labels])+matrix(rnorm(n*G,sd=.12),n,G)
   one <- t(exp(theta)); x <- cbind(one,one)
   rownames(x) <- paste0("G",seq_len(G))
-  list(goal_gene_mt=x,cell_t=cbind(condition=rep(c(1,0),each=n)),K=K,
+  list(network_prior="independent",goal_gene_mt=x,cell_t=cbind(condition=rep(c(1,0),each=n)),K=K,
        num_iter=70L,num_save=40L,adapt_min=6L,adapt_max=20L,
        freeze_patience=4L,final_burnin=10L,diagnostic_every=1L,
        fdr_min_draws=20L,num_step_theta=2L,num_step_lam=2L,
@@ -73,6 +73,8 @@ test_that("joint probabilities equal within-draw conditional products", {
 test_that("K=4 staged inference retains eight references and all sixteen pairs", {
   staged_single_thread({
     a <- staged_fixture(4L)
+    # Keep the original global-score regression distinct from new-score tests.
+    a$matching_score <- "global"
     set.seed(28)
     a$goal_gene_mt <- do.call(cbind,lapply(1:4,function(k) {
       exp(matrix(3*diag(4)[,k],4,12)+matrix(rnorm(48,sd=.12),4))
@@ -145,16 +147,21 @@ test_that("label assignment is globally minimal and deterministic", {
   expect_error(assign(matrix(NA_real_,2,2)),"finite square")
 })
 
-test_that("invalid stage budgets and insufficient stability cannot produce discoveries", {
+test_that("invalid stage budgets and opt-in strict stability cannot produce discoveries", {
   args <- staged_fixture()
   args$final_burnin <- 29
   expect_error(staged_run(args),"final_burnin")
   args <- staged_fixture();args$freeze_patience <- 21
-  expect_error(staged_run(args),"freeze_patience")
+  args$freeze_policy <- "error"
+  expect_error(staged_run(args),"Matching did not stabilize")
   args <- staged_fixture();args$inference_mode <- "coupled";args$differential_method <- "bayes_fdr"
   expect_error(staged_run(args),"requires staged")
   staged_single_thread({
     a <- staged_fixture(4L); a$matching_method <- "greedy"
+    a$matching_score <- "global"; a$freeze_policy <- "error"
+    # No seed or floating-point trajectory can supply more stable iterations
+    # than adapt_max. Previously this test assumed random K=4 maps must change.
+    a$freeze_patience <- a$adapt_max + 1L
     expect_error(staged_run(a),"Matching did not stabilize")
   })
 })

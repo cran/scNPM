@@ -9,8 +9,8 @@ run_scNPM(
   cell_t,
   K,
   ds_seed = 20250102,
-  num_iter = 1000,
-  num_save = 500,
+  num_iter = 5000,
+  num_save = 1000,
   protein_input = NULL,
   ssp_v0 = 0.02,
   ssp_v1 = 1,
@@ -38,7 +38,16 @@ run_scNPM(
   matching_method = c("lexicographic", "greedy"),
   fdr_rule = c("delta_threshold", "posterior_error"),
   group_fdr_level = 0.05,
-  verbose = FALSE
+  verbose = FALSE,
+  matching_score = c("pairwise", "global"),
+  freeze_policy = c("consensus", "error"),
+  freeze_window = 100L,
+  progress_every = 60,
+  progress_file = NULL,
+  network_prior = c("auto", "paired", "independent"),
+  paired_discordance = 0.75,
+  shared_edge_correlation = 0.995,
+  ppi_reference = c("control", "both", "treatment")
 )
 }
 \arguments{
@@ -49,7 +58,8 @@ Row names must be unique gene identifiers; missing names are generated.}
 \item{cell_t}{Finite numeric matrix or data frame, with cells in the same
 order as columns of `goal_gene_mt`. The first column is 0 (control) or
 1 (treatment); both groups must be present. Remaining columns are numeric
-covariates, standardized across both groups. Encode categorical covariates
+covariates, standardized within each pair's training fold (pooled over both
+groups in global mode). Encode categorical covariates
 numerically before calling this function.}
 
 \item{K}{Positive integer number of clusters in each condition, no larger
@@ -91,11 +101,12 @@ baseline edge probabilities unchanged by matching feedback.}
 
 \item{num_step_lam}{Positive integer number of HMC steps for dropout parameters.}
 
-\item{ppi_prior_low}{Baseline inclusion probability for edges without a PPI
+\item{ppi_prior_low}{Baseline edge-state factor for edges without a PPI
 interaction (default 0.05).}
 
 \item{ppi_prior_high}{Baseline inclusion probability for PPI-supported edges
-(default 0.5). Requires `0 < ppi_prior_low <= ppi_prior_high <= 1 - 1e-6`.}
+(default 0.5). In the paired model this defines an odds multiplier, not a
+marginal edge probability. Requires `0 < ppi_prior_low <= ppi_prior_high <= 1 - 1e-6`.}
 
 \item{network_covariates}{Network features in the propensity model.
 `"all_reference"` (default) evaluates every cell against all current
@@ -106,19 +117,20 @@ Other cell covariates are retained; matching_method selects the assignment rule.
 
 \item{propensity_ridge}{Positive diagonal ridge stabilization for the
 pooled logistic IRLS fit (default 1e-6, also applied to the intercept).
-This is a numerical setting, not an empirically tuned penalty.}
+Used only with matching_score = "global". Pairwise regression uses
+a fixed slope penalty of 0.001 times the total observation weight.}
 
-\item{inference_mode}{`staged` (default) or `coupled` (continuous feedback; use greedy matching for version 1.0.3 behavior).}
+\item{inference_mode}{`staged` (default) or `coupled` (continuous feedback; use global scores and greedy matching for the earlier workflow).}
 
 \item{adapt_min}{Earliest freezing iteration. NULL uses min(100, floor(adapt_max/2)), at least 2.}
 
-\item{adapt_max}{Latest adaptation iteration. NULL uses num_iter-num_save-final_burnin.}
+\item{adapt_max}{Latest adaptation iteration. NULL uses min(3000, num_iter-num_save-final_burnin).}
 
 \item{freeze_patience}{Consecutive identical complete maps needed to freeze,
-at least 2. NULL uses min(20, floor(adapt_max/2)), at least 2.}
+at least 2. NULL uses min(5, floor(adapt_max/2)), at least 2.}
 
 \item{final_burnin}{Minimum iterations after disabling feedback and before
-retention. NULL uses floor((num_iter-num_save)/3), at least 1.}
+retention. NULL uses min(1000, floor((num_iter-num_save)/3)), at least 1.}
 
 \item{diagnostic_every}{Positive interval for final-stage J_aug diagnostics;
 adaptation diagnostics and matching histories are recorded every iteration.}
@@ -151,6 +163,41 @@ Each condition/subtype is selected separately over its full gene panel.}
 TRUE emits initialization, progress and timing through message conditions,
 including native sampler progress; suppressMessages() can suppress these.
 Warnings and errors are unaffected.}
+
+\item{matching_score}{Pairwise cross-fitted propensity scores (default), or original global scores.}
+
+\item{freeze_policy}{At the adaptation limit use a consensus map (default), or stop with error.}
+
+\item{freeze_window}{Number of most recent valid maps used for consensus, default 100.}
+
+\item{progress_every}{Positive elapsed-time interval in seconds for progress
+reports (default 60). Reports occur at completed iterations and also at
+start, freezing, first retained draw and completion. A single long sweep
+can delay a report. ETA is an approximate extrapolation of elapsed sampling time.}
+
+\item{progress_file}{Optional CSV path. Append timestamped progress records
+even when verbose is FALSE; parent directory must exist. Use a separate
+file for each concurrent fit. NULL (default) writes no progress file.}
+
+\item{network_prior}{`auto` (default) resolves to `paired` for staged fits
+and `independent` for coupled fits. `paired` jointly models matched T/C
+edge states after freezing. `independent` retains the 1.0.8 network prior.}
+
+\item{paired_discordance}{Positive factor at most 1 (default 0.75) controlling
+discordant-state weights. With b=ppi_prior_low and d=paired_discordance*b*(1-b),
+base weights for 00,10,01,11 are (1-b-d,d,d,b-d). It is not the fraction
+of differential edges and is separate from adaptation's edge_prob_adj.}
+
+\item{shared_edge_correlation}{Correlation in the bivariate slab kernel
+for state 11, in [0,1), default 0.995. Larger values favor closer signed
+precision coefficients for common edges; 10/01 remain uncorrelated.}
+
+\item{ppi_reference}{Condition supported by the PPI source: `control`
+(default), `treatment`, or `both`. Let R be the odds of an edge's PPI
+weight divided by the odds of ppi_prior_low. Multiply the base state
+factor by R for each supported present condition, then normalize.
+Choose both for condition-neutral PPI evidence; control reproduces the
+control-derived PPI design. Ignored by the independent network prior.}
 }
 \value{
 A named list containing all key analysis results (can be saved with `save()`):
@@ -181,8 +228,9 @@ A named list containing all key analysis results (can be saved with `save()`):
 \item{qf_global}{Legacy uncentered per-cell quadratic form retained for compatibility. It enters the propensity model only in legacy mode.}
 \item{network_covariates}{Raw network-feature matrix from the final matching call. Columns are qf_ref_T1 through qf_ref_TK then qf_ref_C1 through qf_ref_CK in all-reference mode, or qf_network in legacy mode.}
 \item{network_covariate_mode}{Selected network feature mode.}
-\item{propensity_scaling}{Pooled centers and scales for the full predictor matrix, with other cell covariates before network features.}
-\item{propensity_scores}{Per-cell propensity scores from the final matching call}
+\item{propensity_scaling}{Pooled centers and scales for global matching; NULL for pairwise matching, which scales each training fold separately.}
+\item{global_reference_scaling}{Pooled feature scaling retained as a diagnostic in both modes.}
+\item{propensity_scores}{Per-cell scores for the selected pair in pairwise mode; pooled scores in global mode. Pairwise scores from different pairs are not a single global propensity score.}
 \item{final_group_label}{Final MCMC cluster label per cell (0-based: treatment cells 0..K-1, control cells K..2K-1; used by compute_qf_smd())}
 \item{edge_diff_networks}{Per-cluster networks selected by differential_method; solid/dashed indicates treatment/control enrichment. The matrix uses Rao-Blackwell contrasts for bayes_fdr and empirical frequency contrasts for frequency.}
 \item{inference_mode, differential_method}{Resolved inference and selection modes.}
@@ -195,7 +243,8 @@ A named list containing all key analysis results (can be saved with `save()`):
 \item{Result}{Retained sampler output, including parameter draws and selected trace summaries}
 
 \item{protein_adjacency}{Symmetric binary PPI adjacency matrix; diagonal entries are zero.}
-\item{edge_prior}{Per-edge baseline inclusion probabilities used at every edge update. Diagonal entries are unused.}
+\item{edge_prior}{Per-edge PPI weights; the paired prior converts their odds relative to ppi_prior_low into state multipliers. Diagonal entries are unused.}
+\item{network_prior, paired_prior}{Resolved prior and paired-model settings; paired_prior is NULL for independent fits.}
 \item{provenance}{Package version, input fingerprint, native-library fingerprint, execution environment, times and analysis settings.}
 }
 \description{
@@ -203,20 +252,37 @@ Estimate condition-specific gene networks using staged stochastic inference.
 The default first adapts networks and matching, aligns component labels to
 fixed initial mean anchors, and freezes a complete mapping after sustained
 stability. It then disables counterpart feedback, completes post-switch
-burn-in and retains final baseline-model samples. Failure to stabilize by
-the adaptation limit stops the run without producing final discoveries.
+burn-in and retains samples under the selected final network prior. At the adaptation limit,
+the default freezes a recent consensus map and records that stability was not established.
 }
 \details{
-Network features are centered distances to all 2*K current references,
-with pooled scaling; the legacy uncentered feature remains available.
-Default differential selection bounds the estimated posterior directional
-error over every possible control counterpart. This is model-based Bayesian
+Network features are centered distances to all 2*K current references.
+Pairwise matching standardizes predictors within each training fold;
+global matching uses pooled scaling. Default differential selection bounds
+the estimated posterior directional error for the frozen counterpart. This is model-based Bayesian
 error selection, not a finite-sample frequentist FDR guarantee. The coupled
-mode reproduces version 1.0.3 and uses descriptive frequency contrasts.
+mode uses descriptive frequency contrasts; combine global scores and greedy
+assignment for the earlier matching behavior.
 The J_aug trace uses an augmented-data likelihood, a state-wise network
 prior kernel and total SMD. It is a diagnostic, not an optimized objective
 or the observed-data marginal likelihood; stochastic decreases are allowed.
 }
+\section{Paired network prior}{
+
+The four states are (treatment, control): 00, 10, 01, 11. Conditional
+Gaussian kernels have diagonal variances (v0^2,v0^2), (v1^2,v0^2),
+(v0^2,v1^2), and v1^2 in both conditions for state 11; only state 11 has
+the specified correlation. All factors belong to one globally normalized
+prior restricted to positive-definite precision matrices. There are no
+gene modules or learned module parameters. After freezing, paired column
+updates integrate one coefficient pair, draw its state, and immediately
+restore both coefficients. Matched components are relabeled together.
+The observation-model HMC updates and NPM criterion remain unchanged.
+Rao-Blackwell probabilities use the joint four-state conditional on each
+retained draw. Unmatched-counterpart probabilities use within-draw marginal
+products under this same frozen-pair model, not separate refits with new priors.
+}
+
 \examples{
 # Small demonstration of staged inference; use longer runs for an analysis.
 set.seed(7)

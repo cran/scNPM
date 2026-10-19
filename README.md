@@ -1,6 +1,6 @@
 # scNPM: Single-Cell Network Propensity Matching
 
-Version **1.0.6** estimates heterogeneous gene conditional-dependence networks
+Version **1.1.0** estimates heterogeneous gene conditional-dependence networks
 and compares matched clusters across two conditions.
 
 ## Installation
@@ -36,10 +36,10 @@ For a separately supplied package archive, use:
 
 ```r
 # Built source archive
-install.packages("scNPM_1.0.6.tar.gz", repos = NULL, type = "source")
+install.packages("scNPM_1.1.0.tar.gz", repos = NULL, type = "source")
 
 # Windows binary archive, if supplied for your R version
-# install.packages("scNPM_1.0.6.zip", repos = NULL, type = "win.binary")
+# install.packages("scNPM_1.1.0.zip", repos = NULL, type = "win.binary")
 ```
 
 Source installation requires R >= 4.0 and a compatible C++17 toolchain;
@@ -94,7 +94,7 @@ stopifnot(nzchar(ppi))
 `cell_t` has one row per cell, in exactly the expression-column order. Its first
 column is the 0/1 group indicator; the other five columns are measured QC
 covariates. Supply these columns on their original scale: the propensity step
-standardizes them across the pooled treatment and control cells. The eight
+standardizes them within each pair-specific training fold. The eight
 network-reference covariates for K = 4 are computed internally.
 
 The PPI file supplies gene pairs and `combined_score`. In this implementation,
@@ -107,26 +107,51 @@ Use `protein_input = NULL` to use the common low baseline prior for all pairs.
 ```r
 fit <- run_scNPM(
   goal_gene_mt = expression, cell_t = cell_t, protein_input = ppi, K = 4,
-  num_iter = 5000, num_save = 2000,
-  inference_mode = "staged", adapt_min = 500, adapt_max = 2000,
-  freeze_patience = 20, final_burnin = 1000,
+  network_prior = "paired", ppi_reference = "both", # condition-neutral STRING PPI
+  num_iter = 5000, num_save = 1000,
+  inference_mode = "staged", adapt_min = 100, adapt_max = 3000,
+  freeze_patience = 5, final_burnin = 1000,
+  matching_score = "pairwise", freeze_policy = "consensus", freeze_window = 100,
   network_covariates = "all_reference", matching_method = "lexicographic",
   differential_method = "bayes_fdr", fdr_level = 0.05,
   fdr_scope = "frozen", fdr_rule = "delta_threshold",
-  group_fdr_level = 0.05, diagnostic_every = 10, ds_seed = 123
+  group_fdr_level = 0.05, diagnostic_every = 10, ds_seed = 123,
+  verbose = TRUE, progress_every = 60, progress_file = "scNPM_progress.csv"
 )
 ```
 
-The example retains iterations 3001--5000. Matching must freeze by iteration
-2000, leaving at least 1000 baseline iterations before retention. If the
-matching does not stabilize, the function reports an error; increase the
-adaptation and total iteration budgets together rather than disabling the
-stability check. Runtime depends on the data, iteration count and hardware.
+The example retains iterations 4001--5000. Matching freezes no later than
+iteration 3000, leaving at least 1000 final-model warmup sweeps. Five consecutive
+identical complete maps allow an earlier stable freeze. At the adaptation cap,
+the default uses the most frequent recent valid map, disables feedback, and
+continues warmup and sampling. Inspect `fit$sampling_schedule$freeze_reason`
+(`stable` or `budget_consensus`) and `matching_stable`; a budget freeze is not
+evidence that correspondence or the MCMC chain has converged. With no valid
+complete map, invalid input, or a numerical error, the run still stops.
+Use `freeze_policy = "error"` for the original strict stability requirement.
+
+`matching_score = "pairwise"` fits a balanced, five-fold ridge propensity
+regression for every candidate cluster pair using the **known** condition
+labels. It retains the shared network references, scalar score SMD, and
+one-to-one maximum-SMD-then-total-SMD assignment. Each pair has a distinct
+conditional score; these scores do not form one global population propensity
+score. Network features are estimated from the current full state; only the
+score regression is cross-fitted. `matching_score = "global"` retains the
+previous pooled score, and can be combined with `network_covariates = "legacy"`
+and `matching_method = "greedy"` when reproducing older workflows.
+
+With `verbose = TRUE`, progress is reported every 60 seconds and at stage
+changes, including iteration, percentage, elapsed time, approximate ETA,
+freeze reason and retained draws. Reports occur between completed sweeps.
+`progress_file` appends CSV records even with `verbose = FALSE`; omit it to
+avoid writing a file. Console messages remain suppressible with
+`suppressMessages()`. Use different CSV paths for concurrent fits.
 
 ### 3. Inspect matching and differential selection
 
 ```r
-fit$matching_result_df                 # Reported pairs and final-state SMDs
+fit$matching_result_df                 # Reported cluster pairs
+fit$smd_results                        # Final-state score SMDs
 fit$matching_objective                 # Maximum and total SMD for that map
 fit$sampling_schedule                 # Freeze and retained-sample schedule
 fit$group_fdr$summary                  # Separate BFDR for each group network
@@ -299,18 +324,24 @@ Runtime, dimensions, stages and diagnostic values are returned in the result.
    Exact ties use a fixed traversal; no SMD cap is applied.
 2. Freeze a complete bijection after `freeze_patience` consecutive identical
    assignments, no earlier than `adapt_min`. Every cluster must be nonempty at
-   these checks. Stop with an error if this has not occurred by `adapt_max`.
-3. From the next iteration, switch the edge adjustment multiplier to 1. This
-   restores the edge-specific baseline PPI weights. Finish at least
-   `final_burnin` iterations under this model before retaining the last
-   `num_save` draws. The frozen matching remains the reported correspondence.
+   these checks. At `adapt_max`, `freeze_policy = "consensus"` selects the most
+   frequent complete map in the last `freeze_window` valid states. Ties use
+   maximum cost, then total cost, on the window's average cost matrix, followed
+   by lexicographic map order. `freeze_policy = "error"` requests the previous
+   strict rule. The schedule records which freezing rule was used.
+3. From the next iteration, disable adaptation feedback and activate the
+   selected final network prior. The default jointly samples four edge states
+   for matched pairs. Finish at least `final_burnin` iterations before retaining
+   the last `num_save` draws. Matched components are relabeled together so their
+   partners are preserved. The frozen mapping is not reoptimized.
 4. Select group edges separately for each condition/subtype using marginal
    posterior errors. Select directional differential edges from final-stage joint edge-state
    probabilities, across all K clusters as one family.
 
-The final sampling target is the baseline model without counterpart feedback.
-Matching affects adaptation and the reported comparisons; it does not keep
-altering the final network prior. Re-run analyses when moving from 1.0.3.
+The default final target uses a four-state paired network prior. The matching
+determines which networks share this prior. Set `network_prior = "independent"`
+to retain the 1.0.8 final network model. Existing fits cannot be converted to
+the new posterior by changing selection thresholds; rerun sampling.
 
 The observation model is unchanged: positive values fix latent expression at
 log X; zero values have sampled latent expression. HMC uses fixed step sizes,
@@ -324,11 +355,15 @@ For every cell in either condition, the default uses centered distances to all
 $$q_{i,r}^{d;s}=(\theta_i^d-\mu_r^s)^\top\Omega_r^s(\theta_i^d-\mu_r^s),\quad s\in\{T,C\}.$$
 
 K = 4 therefore uses eight network covariates. These and the optional QC
-covariates enter the logistic propensity model. Each column is standardized
-using its pooled mean and sample standard deviation over both conditions.
-Constant columns become zero. `propensity_ridge = 1e-6` stabilizes IRLS.
-`network_covariates = "legacy"` requests the original assigned-network,
-uncentered quadratic form. Inspect both propensity-score and feature SMDs.
+covariates enter the logistic propensity model. With the default pairwise
+scores, each candidate cluster pair has a separate regression. Predictor
+scaling is learned in each training fold, the two conditions have equal total
+weight, and the slope penalty is 0.001 times the total observation weight.
+With `matching_score = "global"`, predictors use pooled scaling and
+`propensity_ridge = 1e-6` stabilizes the pooled IRLS fit. Constant columns become
+zero. `network_covariates = "legacy"` requests the original assigned-network,
+uncentered quadratic form and requires global scores. Inspect both
+propensity-score and feature SMDs.
 
 ## Inputs and a staged analysis
 
@@ -355,8 +390,11 @@ claim means slab allocation in k and spike allocation in its control
 counterpart. A control-direction claim means the reverse. These are continuous
 spike-and-slab states, not exact zero precision entries or gene absence.
 
-The package averages within-draw conditional products for all K x K pairs.
-It does not multiply marginal edge-frequency estimates. The more supported
+The package averages joint four-state conditional probabilities for frozen
+pairs. For other counterparts it averages within-draw products of conditional
+marginals under the same frozen-pair model. The independent option uses
+within-draw products for every pair. Neither multiplies posterior mean edge
+frequencies. All-counterpart sensitivity does not refit alternative paired priors. The more supported
 direction under the frozen pairing supplies the reported direction.
 
 - `fdr_scope = "frozen"` (default): use errors for the frozen counterpart.
@@ -381,10 +419,9 @@ exploratory curve but no threshold discoveries. This minimum is not a mixing
 guarantee. The batch MCSE is a diagnostic, not a confidence bound.
 
 This is an estimated **posterior expected directional FDP**, conditional on the
-baseline model and label convention. A target of 0.05 is not a uniform
+selected final model and label convention. A target of 0.05 is not a uniform
 frequentist 5% guarantee across fixed network configurations, donors, model
-misspecification or incomplete mixing. The supplied simulation report evaluates
-this distinction explicitly. Donor dependence is not modeled by adding a donor
+misspecification or incomplete mixing. Donor dependence is not modeled by adding a donor
 column to the propensity model.
 
 ```r
@@ -458,8 +495,50 @@ use Rao-Blackwellization. Raw draws remain in `Result`.
 
 The baseline PPI inclusion weight is
 `ppi_prior_low + (ppi_prior_high - ppi_prior_low) * protein_adjacency`, with
-defaults 0.05 and 0.5. It is used at every edge update, including the final
-phase. The SPD matrix constraint is part of the joint network prior.
+defaults 0.05 and 0.5. During adaptation and in independent-prior mode these
+are inclusion weights. The paired prior uses their odds ratios as described
+below. The positive-definite matrix constraint is part of the joint prior.
+
+
+## Four-state matched-network prior in 1.1.0
+
+```r
+# These settings are also recorded in fit$paired_prior and fit$provenance.
+# Add them to the run_scNPM call above:
+# network_prior = "paired",
+# paired_discordance = 0.75,
+# shared_edge_correlation = 0.995,
+# ppi_reference = "control"
+```
+
+For each frozen pair and gene pair, S=(gamma_T,gamma_C) takes states
+00 (neither), 10 (treatment only), 01 (control only), 11 (both).
+Let b=ppi_prior_low and d=paired_discordance*b*(1-b). Base state factors are
+(1-b-d,d,d,b-d). For an edge with PPI weight pi, define
+R={pi/(1-pi)}/{b/(1-b)}. `ppi_reference="control"` multiplies the 01 and 11
+factors by R. `"treatment"` multiplies 10 and 11. `"both"` multiplies 10/01
+by R and 11 by R^2. Normalize the four factors before using them. The default
+control setting matches control-derived PPI experiments; use both when PPI
+evidence is condition-neutral. A missing PPI edge has R=1, not a forced absence.
+
+The Gaussian coefficient kernels have covariance matrices
+
+$$\Sigma_{00}=\operatorname{diag}(v_0^2,v_0^2),\quad
+\Sigma_{10}=\operatorname{diag}(v_1^2,v_0^2),\quad
+\Sigma_{01}=\operatorname{diag}(v_0^2,v_1^2),$$
+$$\Sigma_{11}=v_1^2\begin{pmatrix}1&r\\r&1\end{pmatrix}.$$
+
+Here r=shared_edge_correlation; the default 0.995 strongly favors similar
+signed coefficients for shared edges. All factors define one globally normalized
+prior with positive-definite precision constraints. The model uses edge-level
+paired states and retains the existing observation-model HMC.
+The paired graph kernel integrates one treatment/control coefficient pair
+when drawing its state and immediately restores both coefficients.
+
+BFDR levels and tie handling are unchanged. A matched edge's p10/p01 now comes
+from this joint conditional, and group probabilities are p10+p11 or p01+p11.
+Matching freeze fixes cluster correspondence; the subsequent sampling stage
+estimates the paired network posterior.
 
 For formulae, assumptions and the error-bound proof, read
 [algorithm.md](inst/algorithm.md). This file is also installed in the

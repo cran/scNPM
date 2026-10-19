@@ -2,7 +2,9 @@
 #include <random>
 #include <iomanip>
 #include <algorithm>
+#include <chrono>
 #include "global_matching.h"
+#include "freeze_consensus.h"
 
 // [[Rcpp::export]]
 int set_scNPM_threads(int threads) {
@@ -419,7 +421,8 @@ Rcpp::List network_propensity_matching_impl(
   const mat* mu_treat, const mat* mu_ctrl,
   const std::string& network_covariates, const double propensity_ridge,
   const bool diagnostics, const uvec* fixed_map = nullptr,
-  const std::string& matching_method = "greedy") {
+  const std::string& matching_method = "greedy",
+  SEXP matching_cost_function = R_NilValue) {
 
   if(matching_method!="lexicographic" && matching_method!="greedy")
     Rcpp::stop("matching_method must be lexicographic or greedy.");
@@ -512,6 +515,19 @@ Rcpp::List network_propensity_matching_impl(
       smd_cost(k,c)=standardized_mean_difference(cluster_mean_treat(k),cluster_mean_ctrl(c),
         cluster_var_treat(k),cluster_var_ctrl(c));
 
+  mat pair_scores;
+  if (!Rf_isNull(matching_cost_function)) {
+    Rcpp::Function callback(matching_cost_function);
+    Rcpp::NumericMatrix callback_X = Rcpp::wrap(Xcov);
+    callback_X.attr("matching_K")=K;
+    Rcpp::List custom = callback(callback_X, treatment_status, group_treat,
+                                group_ctrl, treat_idx, ctrl_idx);
+    smd_cost = Rcpp::as<mat>(custom["cost"]);
+    pair_scores = Rcpp::as<mat>(custom["scores"]);
+    if (smd_cost.n_rows != (uword)K || smd_cost.n_cols != (uword)K ||
+        pair_scores.n_rows != N || pair_scores.n_cols != (uword)K)
+      Rcpp::stop("Invalid pairwise propensity dimensions.");
+  }
   std::vector<uword> sorted_clusters;
   for (uword k = 0; k < static_cast<uword>(K); ++k)
     if (count_treat(k) > 0) sorted_clusters.push_back(k);
@@ -562,6 +578,17 @@ Rcpp::List network_propensity_matching_impl(
   }
   }
 
+  if (!Rf_isNull(matching_cost_function)) {
+    for (uword k=0; k<(uword)K; ++k) {
+      uword c=treat2ctrl_map(k);
+      if(c>=(uword)K) continue;
+      smd_results(k)=smd_cost(k,c);
+      for(uword i=0;i<treat_idx.n_elem;++i)
+        if(group_treat(i)==k) base_propensity(treat_idx(i))=pair_scores(treat_idx(i),c);
+      for(uword i=0;i<ctrl_idx.n_elem;++i)
+        if(group_ctrl(i)==c) base_propensity(ctrl_idx(i))=pair_scores(ctrl_idx(i),k);
+    }
+  }
   if (!diagnostics)
     return Rcpp::List::create(Rcpp::_["treat2ctrl_cluster_map"] = treat2ctrl_map);
 
@@ -710,7 +737,8 @@ void update_edge_with_matching_by_difficulty(
   const uvec &treat_idx, const uvec &ctrl_idx, const mat& edge_prior,
   const mat& mu_treat, const mat& mu_ctrl,
   const std::string& network_covariates, double propensity_ridge, const uvec* fixed_map = nullptr,
-  const std::string& matching_method = "greedy") {
+  const std::string& matching_method = "greedy",
+  SEXP matching_cost_function = R_NilValue) {
   
   double edge_prob_threshold_up = std::max(edge_prob_threshold, 1.0 - edge_prob_threshold);
   double edge_prob_threshold_down = std::min(edge_prob_threshold, 1.0 - edge_prob_threshold);
@@ -721,7 +749,7 @@ void update_edge_with_matching_by_difficulty(
     Rcpp::List matching_result = network_propensity_matching_impl(
       theta_t, cell_t, group_treat, group_ctrl, treat_idx, ctrl_idx,
       invcov_treat, invcov_ctrl, G, K,
-      &mu_treat, &mu_ctrl, network_covariates, propensity_ridge, false, nullptr, matching_method);
+      &mu_treat, &mu_ctrl, network_covariates, propensity_ridge, false, nullptr, matching_method, matching_cost_function);
     treat2ctrl_map = Rcpp::as<uvec>(matching_result["treat2ctrl_cluster_map"]);
   }
   uvec ctrl2treat_map(K);
@@ -780,7 +808,7 @@ void update_edge_with_matching_by_difficulty(
           } else {
             edge_treat(g, i, k) = (tmp < original_prob) ? 1 : 0;
           }
-          edge_treat(i, g, k) = edge_treat(g, i, k); // 对称矩阵
+          edge_treat(i, g, k) = edge_treat(g, i, k); // 瀵圭О鐭╅樀
         }
       }
 
@@ -818,7 +846,7 @@ void update_edge_with_matching_by_difficulty(
           } else {
             edge_ctrl(g, i, k) = (tmp < original_prob) ? 1 : 0;
           }
-          edge_ctrl(i, g, k) = edge_ctrl(g, i, k); // 对称矩阵
+          edge_ctrl(i, g, k) = edge_ctrl(g, i, k); // 瀵圭О鐭╅樀
         }
       }
     }
@@ -998,6 +1026,26 @@ void update_group(vec &group_t, const cube &invcov_t, const mat &theta_t, const 
 }
 
 #include "staged_inference.h"
+#include "paired_prior.h"
+
+// Internal numerical diagnostic: a small coupled Gaussian column has a
+// finite 16-state reference distribution that can be enumerated independently.
+// [[Rcpp::export]]
+Rcpp::List paired_column_diagnostic(int draws = 25000) {
+  if(draws<1 || draws>1000000) Rcpp::stop("draws must be between 1 and 1000000.");
+  mat L(4,4,fill::zeros); L.diag()=vec({2.,1.5,1.7,2.2});
+  L(0,1)=L(1,0)=.35;L(2,3)=L(3,2)=-.15;
+  vec s={-.7,.4,-.5,.2},prior={.05,.5},zt(2,fill::zeros),zc(2,fill::zeros),b(4,fill::zeros);
+  mat H=L, samples(draws,4),states(draws,2);std::mt19937 rng(110018);
+  for(uword j=0;j<2;++j){uvec ix={j,2+j};H.submat(ix,ix)+=paired_precision(0,.2,.8,.8);}
+  for(int i=-2000;i<draws;++i){
+    if(i%1000==0)Rcpp::checkUserInterrupt();
+    b=paired_column(H,zt,zc,s,prior,.05,.75,.2,.8,.8,0,rng,b);
+    if(i>=0){samples.row(i)=b.t();states.row(i)=(zt+2*zc).t();}
+  }
+  return Rcpp::List::create(Rcpp::_["coefficients"]=samples,Rcpp::_["states"]=states,
+    Rcpp::_["likelihood_precision"]=L,Rcpp::_["linear_term"]=s,Rcpp::_["ppi_weights"]=prior);
+}
 
 // [[Rcpp::export]]
 Rcpp::List MCMC_with_difficulty_based_matching(
@@ -1023,7 +1071,24 @@ Rcpp::List MCMC_with_difficulty_based_matching(
   std::string network_covariates = "all_reference", double propensity_ridge = 1e-6,
   std::string inference_mode = "coupled", int adapt_min = 1, int adapt_max = 1,
   int freeze_patience = 2, int final_burnin = 1, int diagnostic_every = 10,
-  std::string matching_method = "greedy", bool verbose = false) {
+  std::string matching_method = "greedy", bool verbose = false,
+  std::string freeze_policy = "consensus", int freeze_window = 100,
+  SEXP matching_cost_function = R_NilValue, double progress_every = 60.0,
+  SEXP progress_callback = R_NilValue, std::string network_prior = "independent",
+  double paired_base = 0.05, double paired_discordance = 0.75,
+  double shared_edge_correlation = 0.995, std::string ppi_reference = "control") {
+  const bool paired = network_prior == "paired";
+  if ((!paired && network_prior != "independent") ||
+      (paired && inference_mode != "staged") ||
+      !std::isfinite(paired_base) || paired_base<=0 || paired_base>=1 ||
+      !std::isfinite(paired_discordance) || paired_discordance<=0 || paired_discordance>1 ||
+      !std::isfinite(shared_edge_correlation) || shared_edge_correlation<0 || shared_edge_correlation>=1 ||
+      (ppi_reference!="control" && ppi_reference!="treatment" && ppi_reference!="both"))
+    Rcpp::stop("Invalid paired prior settings; paired inference requires staged sampling.");
+  const int paired_reference=ppi_reference=="control"?0:(ppi_reference=="treatment"?1:2);
+
+  if (!std::isfinite(progress_every) || progress_every <= 0)
+    Rcpp::stop("progress_every must be a positive number of seconds.");
 
   if(matching_method!="lexicographic" && matching_method!="greedy")
     Rcpp::stop("matching_method must be lexicographic or greedy.");
@@ -1128,15 +1193,22 @@ Rcpp::List MCMC_with_difficulty_based_matching(
   group_treat = group_treat - 1;
   group_ctrl = group_ctrl - 1;
   
+  if ((freeze_policy != "consensus" && freeze_policy != "error") || freeze_window < 1)
+    Rcpp::stop("Invalid freeze policy or consensus window.");
   const bool staged = inference_mode == "staged";
   if (!staged && inference_mode != "coupled") Rcpp::stop("Unknown inference_mode.");
   int save_start = num_iter - num_save;
   if (diagnostic_every < 1 || (staged && (adapt_min < 1 || adapt_max < adapt_min ||
-      freeze_patience < 2 || freeze_patience > adapt_max || final_burnin < 1 ||
+      freeze_patience < 2 || final_burnin < 1 ||
       adapt_max + final_burnin > save_start || any(abs(gam - gam(0)) > 1e-12))))
     Rcpp::stop("Invalid staged budget or non-exchangeable component prior.");
   const mat anchor_treat = mu_treat, anchor_ctrl = mu_ctrl;
   bool frozen = false;
+  std::string freeze_reason = "not_frozen";
+  bool matching_stable = false;
+  double freeze_consensus_fraction = datum::nan;
+  int freeze_window_used = 0;
+  std::deque<FreezeRecord> freeze_records;
   int frozen_at = -1, stable_count = 0;
   uvec frozen_map(K), previous_map(K); previous_map.fill(K); frozen_map.fill(K);
   mat map_history(num_iter, K, fill::value(datum::nan));
@@ -1172,6 +1244,33 @@ Rcpp::List MCMC_with_difficulty_based_matching(
   // All R callbacks occur on the main thread, outside OpenMP regions.
   Rcpp::Function progress_message = Rcpp::Environment::base_env()["message"];
   if (verbose) progress_message("MCMC started...");
+  const auto progress_start = std::chrono::steady_clock::now();
+  auto last_progress = progress_start;
+  auto report_progress = [&](int completed, const std::string& stage, bool force) {
+    if (!verbose && Rf_isNull(progress_callback)) return;
+    const auto now = std::chrono::steady_clock::now();
+    if (!force && std::chrono::duration<double>(now-last_progress).count() < progress_every) return;
+    const double elapsed = std::chrono::duration<double>(now-progress_start).count();
+    const double eta = completed > 0 ? elapsed * (num_iter-completed)/completed : NA_REAL;
+    Rcpp::List record = Rcpp::List::create(
+      Rcpp::_["iteration"]=completed, Rcpp::_["total"]=num_iter,
+      Rcpp::_["stage"]=stage, Rcpp::_["elapsed_seconds"]=elapsed,
+      Rcpp::_["eta_seconds"]=eta, Rcpp::_["stable_count"]=stable_count,
+      Rcpp::_["stable_required"]=freeze_patience,
+      Rcpp::_["freeze_reason"]=freeze_reason,
+      Rcpp::_["frozen_at"]=frozen ? frozen_at : NA_INTEGER,
+      Rcpp::_["retained_draws"]=std::max(0,completed-save_start),
+      Rcpp::_["retained_target"]=num_save);
+    if (!Rf_isNull(progress_callback)) {
+      Rcpp::Function callback(progress_callback); callback(record);
+    } else if (verbose) {
+      progress_message("MCMC iteration " + std::to_string(completed) + "/" +
+        std::to_string(num_iter) + " | " + stage + " | elapsed " +
+        std::to_string(elapsed) + " s | ETA " + std::to_string(eta) + " s");
+    }
+    last_progress=now;
+  };
+  report_progress(0,staged ? "adaptation" : "coupled",true);
 
   cube invcov_treat_save(G_u, G_u, K_u, fill::zeros);
   cube invcov_ctrl_save(G_u, G_u, K_u, fill::zeros);
@@ -1217,9 +1316,6 @@ Rcpp::List MCMC_with_difficulty_based_matching(
     Rcpp::checkUserInterrupt();
     const bool feedback_this_iter = !staged || !frozen;
     const int stage_code = !staged ? 0 : (!frozen ? 1 : (t_iter < save_start ? 2 : 3));
-    if (verbose && ((t_iter + 1) % std::max(1, num_iter / 100) == 0 || t_iter + 1 == num_iter)) {
-      progress_message("MCMC iteration " + std::to_string(t_iter + 1) + "/" + std::to_string(num_iter));
-    }
 
     iter_seed = static_cast<unsigned long>(randi(distr_param(1, 1000000)));
     update_theta(theta_treat_t, ind_zero_treat, mu_treat, invcov_treat_owned, cov_treat_owned, 
@@ -1238,6 +1334,18 @@ Rcpp::List MCMC_with_difficulty_based_matching(
     update_mu(mu_treat, theta_treat_t, invcov_treat_owned, group_treat, G, K, eta_mu, tau_sq_mu);
     update_mu(mu_ctrl, theta_ctrl_t, invcov_ctrl_owned, group_ctrl, G, K, eta_mu, tau_sq_mu);
     
+    if (paired && frozen) {
+      iter_seed=static_cast<unsigned long>(randi(distr_param(1,1000000)));
+      paired_graph(invcov_treat_owned,cov_treat_owned,edge_treat_owned,
+        invcov_ctrl_owned,cov_ctrl_owned,edge_ctrl_owned,
+        theta_treat_t,mu_treat,group_treat,theta_ctrl_t,mu_ctrl,group_ctrl,
+        edge_prior_mat,frozen_map,paired_base,paired_discordance,ssp_v0,ssp_v1,
+        shared_edge_correlation,paired_reference,ssp_l,G,K,iter_seed);
+      iter_seed=static_cast<unsigned long>(randi(distr_param(1,1000000)));
+      paired_support(edge_treat_owned,edge_ctrl_owned,invcov_treat_owned,invcov_ctrl_owned,
+        edge_prior_mat,frozen_map,paired_base,paired_discordance,ssp_v0,ssp_v1,
+        shared_edge_correlation,paired_reference,iter_seed);
+    } else {
     iter_seed = static_cast<unsigned long>(randi(distr_param(1, 1000000)));
     update_invcov(invcov_treat_owned, cov_treat_owned, edge_treat_owned, theta_treat_t, mu_treat, group_treat, 
                   ssp_v0, ssp_v1, ssp_l, G, K, iter_seed);
@@ -1251,9 +1359,11 @@ Rcpp::List MCMC_with_difficulty_based_matching(
       edge_treat_owned, edge_ctrl_owned, invcov_treat_owned, invcov_ctrl_owned, ssp_v0, ssp_v1, ssp_xi, edge_prob_threshold, feedback_this_iter ? edge_prob_adj : 1.0,
       G, K, N, iter_seed,
       theta_t, cell_t, group_treat, group_ctrl, treat_idx, ctrl_idx, edge_prior_mat,
-      mu_treat, mu_ctrl, network_covariates, propensity_ridge, frozen ? &frozen_map : nullptr, matching_method
+      mu_treat, mu_ctrl, network_covariates, propensity_ridge, frozen ? &frozen_map : nullptr, matching_method, matching_cost_function
     );
     
+    }
+
     iter_seed = static_cast<unsigned long>(randi(distr_param(1, 1000000)));
     update_group(group_treat, invcov_treat_owned, theta_treat_t, mu_treat, pi_treat, G, n_treat, K, iter_seed);
     
@@ -1267,10 +1377,16 @@ Rcpp::List MCMC_with_difficulty_based_matching(
     update_pi(pi_ctrl, group_ctrl, gam, K);
     
     if (staged) {
+      if (paired && frozen) {
+        paired_align(anchor_treat,anchor_ctrl,mu_treat,mu_ctrl,invcov_treat_owned,
+          invcov_ctrl_owned,cov_treat_owned,cov_ctrl_owned,edge_treat_owned,
+          edge_ctrl_owned,pi_treat,pi_ctrl,group_treat,group_ctrl,frozen_map);
+      } else {
       align_components(anchor_treat, mu_treat, invcov_treat_owned, cov_treat_owned,
                        edge_treat_owned, pi_treat, group_treat);
       align_components(anchor_ctrl, mu_ctrl, invcov_ctrl_owned, cov_ctrl_owned,
                        edge_ctrl_owned, pi_ctrl, group_ctrl);
+      }
       group_t(treat_idx) = group_treat;
       group_t(ctrl_idx) = group_ctrl + static_cast<double>(K);
     }
@@ -1280,28 +1396,58 @@ Rcpp::List MCMC_with_difficulty_based_matching(
       Rcpp::List current_match = network_propensity_matching_impl(
         theta_t, cell_t, group_treat, group_ctrl, treat_idx, ctrl_idx,
         invcov_treat_owned, invcov_ctrl_owned, G, K, &mu_treat, &mu_ctrl,
-        network_covariates, propensity_ridge, true, frozen ? &frozen_map : nullptr, matching_method);
-      const uvec current_map = Rcpp::as<uvec>(current_match["treat2ctrl_cluster_map"]);
+        network_covariates, propensity_ridge, true, frozen ? &frozen_map : nullptr, matching_method, matching_cost_function);
+      uvec current_map = Rcpp::as<uvec>(current_match["treat2ctrl_cluster_map"]);
       if (!frozen) {
         bool complete = all(current_map < static_cast<uword>(K));
         for (int k = 0; k < K; ++k)
           complete = complete && any(group_treat == k) && any(group_ctrl == k);
+        mat current_cost = Rcpp::as<mat>(current_match["smd_cost_matrix"]);
+        bool valid_cost = current_cost.is_finite();
+        if(complete && valid_cost) {
+          freeze_records.push_back(FreezeRecord{current_map,current_cost});
+          if((int)freeze_records.size()>freeze_window) freeze_records.pop_front();
+        }
+        complete = complete && valid_cost;
         stable_count = complete ? (all(current_map == previous_map) ? stable_count + 1 : 1) : 0;
         previous_map = current_map;
         if (t_iter + 1 >= adapt_min && stable_count >= freeze_patience) {
           frozen = true; frozen_at = t_iter + 1; frozen_map = current_map;
-          frozen_smd_cost=Rcpp::as<mat>(current_match["smd_cost_matrix"]);
+          frozen_smd_cost=current_cost;
+          freeze_reason="stable"; matching_stable=true;
+          freeze_window_used=(int)freeze_records.size();
+          int votes=0; for(const auto& r:freeze_records) if(all(r.map==frozen_map)) ++votes;
+          freeze_consensus_fraction=double(votes)/freeze_window_used;
         }
-        if (!frozen && t_iter + 1 >= adapt_max)
-          Rcpp::stop("Matching did not stabilize by adapt_max; no final inference or FDR discoveries produced. Increase adaptation budget or inspect cluster separation.");
+        if (!frozen && t_iter + 1 >= adapt_max) {
+          if(freeze_policy=="error")
+            Rcpp::stop("Matching did not stabilize by adapt_max (strict freeze_policy=error).");
+          if(freeze_records.empty())
+            Rcpp::stop("No valid complete finite-cost matching was observed; inspect empty clusters or numerical inputs.");
+          FreezeChoice choice=select_freeze_consensus(freeze_records);
+          frozen=true; frozen_at=t_iter+1; frozen_map=choice.map;
+          frozen_smd_cost=choice.average_cost;
+          freeze_reason="budget_consensus"; matching_stable=false;
+          freeze_consensus_fraction=choice.fraction;
+          freeze_window_used=(int)freeze_records.size();
+          current_map=frozen_map;
+          if(verbose) Rcpp::message(Rcpp::wrap("Adaptation budget reached: froze consensus map; stability not established. Final burn-in and sampling continue."));
+        }
       }
       map_history.row(t_iter) = conv_to<rowvec>::from(current_map + 1);
-      const vec smd = Rcpp::as<vec>(current_match["smd_results"]);
+      vec smd = Rcpp::as<vec>(current_match["smd_results"]);
+      if(freeze_reason=="budget_consensus" && frozen_at==t_iter+1) {
+        mat cost_now=Rcpp::as<mat>(current_match["smd_cost_matrix"]);
+        for(int k=0;k<K;++k) smd(k)=cost_now(k,current_map(k));
+      }
       double match_loss = smd.is_finite() ? sum(smd) : datum::nan;
       const double ll = augmented_likelihood(theta_t, ind_zero, mu_treat, mu_ctrl,
         invcov_treat_owned, invcov_ctrl_owned, group_treat, group_ctrl,
         treat_idx, ctrl_idx, pi_treat, pi_ctrl, lambda0_t, lambda1_t);
-      const double lp = network_prior_kernel(invcov_treat_owned, invcov_ctrl_owned,
+      const double lp = (paired && !feedback_this_iter) ?
+        paired_prior_kernel(invcov_treat_owned,invcov_ctrl_owned,edge_treat_owned,
+          edge_ctrl_owned,edge_prior_mat,frozen_map,paired_base,paired_discordance,
+          ssp_v0,ssp_v1,shared_edge_correlation,paired_reference,ssp_l) : network_prior_kernel(invcov_treat_owned, invcov_ctrl_owned,
         edge_treat_owned, edge_ctrl_owned, edge_prior_mat, current_map,
         ssp_v0, ssp_v1, ssp_l, edge_prob_threshold,
         feedback_this_iter ? edge_prob_adj : 1.0);
@@ -1317,7 +1463,12 @@ Rcpp::List MCMC_with_difficulty_based_matching(
       if (staged) {
         if (!frozen || save_start - frozen_at < final_burnin)
           Rcpp::stop("Final samples must follow freezing and post-feedback burn-in.");
-        accumulate_joint_probabilities(invcov_treat_owned, invcov_ctrl_owned,
+        if (paired) paired_accumulate(invcov_treat_owned,invcov_ctrl_owned,
+          edge_treat_owned,edge_ctrl_owned,edge_prior_mat,frozen_map,paired_base,
+          paired_discordance,ssp_v0,ssp_v1,shared_edge_correlation,paired_reference,
+          joint00,joint10,joint01,joint11,empirical10,empirical01,
+          batch10,batch01,batch_sizes,save_i*batch_count/num_save);
+        else accumulate_joint_probabilities(invcov_treat_owned, invcov_ctrl_owned,
           edge_treat_owned, edge_ctrl_owned, edge_prior_mat, ssp_v0, ssp_v1,
           joint00, joint10, joint01, joint11, empirical10, empirical01,
           batch10, batch01, batch_sizes, save_i * batch_count / num_save);
@@ -1369,6 +1520,12 @@ Rcpp::List MCMC_with_difficulty_based_matching(
       if (n_ctrl > 0) theta_ctrl_iter.col(save_i)  = theta_ctrl_t.col(0);
       if (N > 0) theta_iter.col(save_i)            = theta_t.col(0);
     }
+    const bool just_frozen = frozen && frozen_at==t_iter+1;
+    const std::string progress_stage = t_iter+1==num_iter ? "completed" :
+      (stage_code==0 ? "coupled" : (stage_code==1 ? "adaptation" :
+        (stage_code==2 ? "final_burnin" : "retained")));
+    report_progress(t_iter+1,progress_stage,
+      just_frozen || t_iter==save_start || t_iter+1==num_iter);
   }
   
   if (verbose) progress_message("MCMC completed!");
@@ -1401,7 +1558,7 @@ Rcpp::List MCMC_with_difficulty_based_matching(
   Rcpp::List final_matching = network_propensity_matching_impl(
     theta_t, cell_t, group_treat, group_ctrl, treat_idx, ctrl_idx,
     invcov_treat_owned, invcov_ctrl_owned, G, K,
-    &mu_treat, &mu_ctrl, network_covariates, propensity_ridge, true, frozen ? &frozen_map : nullptr, matching_method);
+    &mu_treat, &mu_ctrl, network_covariates, propensity_ridge, true, frozen ? &frozen_map : nullptr, matching_method, matching_cost_function);
   if (staged) {
     joint00 /= num_save; joint10 /= num_save; joint01 /= num_save; joint11 /= num_save;
     empirical10 /= num_save; empirical01 /= num_save;
@@ -1440,7 +1597,12 @@ Rcpp::List MCMC_with_difficulty_based_matching(
     Rcpp::Named("stage_history") = stage_history,
     Rcpp::Named("matching_history") = map_history,
     Rcpp::Named("criterion_trace") = criterion_trace,
+    Rcpp::Named("network_prior") = network_prior,
     Rcpp::Named("frozen_at") = frozen_at,
+    Rcpp::Named("freeze_reason") = freeze_reason,
+    Rcpp::Named("matching_stable") = matching_stable,
+    Rcpp::Named("freeze_consensus_fraction") = freeze_consensus_fraction,
+    Rcpp::Named("freeze_window_used") = freeze_window_used,
     Rcpp::Named("frozen_smd_cost_matrix") = frozen_smd_cost,
     Rcpp::Named("label_anchors") = Rcpp::List::create(Rcpp::_["treatment"] = anchor_treat, Rcpp::_["control"] = anchor_ctrl),
     Rcpp::Named("joint_edge_probabilities") = Rcpp::List::create(
